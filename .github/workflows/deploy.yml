@@ -1,0 +1,123 @@
+name: Deploy PhotoCraft web to GitHub Pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to deploy (e.g. v0.3.0). Empty = newest published release."
+        required: false
+        default: ""
+      force:
+        description: "Deploy even if that version is already live"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 */6 * * *" # every 6 hours; only deploys when there's a new release
+  push:
+    branches: [main]
+    paths: [.github/workflows/deploy.yml]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: storytold/photocraft
+
+jobs:
+  resolve:
+    name: Find release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      deploy: ${{ steps.check.outputs.deploy }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Pick release
+        id: release
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            # Newest non-draft release (prereleases included) that ships a web zip.
+            tag="$(gh api "repos/$SOURCE_REPO/releases?per_page=30" --jq '
+              [.[] | select(.draft | not)
+                   | select(any(.assets[]; .name | test("^photocraft-web-.*\\.zip$")))]
+              | first | .tag_name // empty')"
+          fi
+          [ -n "$tag" ] || { echo "::error::No release with a photocraft-web-*.zip asset found in $SOURCE_REPO"; exit 1; }
+          echo "Release: $tag"
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+
+      - name: Compare with deployed version
+        id: check
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          FORCE: ${{ inputs.force }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          deploy=true
+          if [ "$EVENT" = schedule ] && [ "$FORCE" != true ]; then
+            site="$(gh api "repos/$GITHUB_REPOSITORY/pages" --jq .html_url 2>/dev/null || true)"
+            if [ -n "$site" ]; then
+              live="$(curl -fsSL "${site%/}/version.txt" 2>/dev/null | tr -d '[:space:]' || true)"
+              echo "Live version: ${live:-<none>}"
+              if [ "$live" = "$TAG" ]; then deploy=false; fi
+            fi
+          fi
+          echo "deploy=$deploy" | tee -a "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy
+    needs: resolve
+    if: needs.resolve.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - name: Download web build
+        run: |
+          mkdir -p dl
+          gh release download "$TAG" --repo "$SOURCE_REPO" --pattern 'photocraft-web-*.zip' --dir dl
+          ls -lh dl
+          if gh release download "$TAG" --repo "$SOURCE_REPO" --pattern 'SHA256SUMS.txt' --dir dl 2>/dev/null; then
+            (cd dl && grep -E ' photocraft-web-.*\.zip$' SHA256SUMS.txt | sha256sum -c -)
+          else
+            echo "::warning::No SHA256SUMS.txt in $TAG; skipping checksum verification"
+          fi
+
+      - name: Unpack
+        run: |
+          unzip -q dl/photocraft-web-*.zip -d unpacked
+          # The zip holds a single photocraft-web-<version>/ folder.
+          index="$(find unpacked -maxdepth 2 -name index.html -print -quit)"
+          [ -n "$index" ] || { echo "::error::index.html not found in the zip"; exit 1; }
+          mv "$(dirname "$index")" site
+          echo "$TAG" >site/version.txt
+          touch site/.nojekyll
+          ls -la site
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Summary
+        run: echo "Deployed PhotoCraft **$TAG** to ${{ steps.deployment.outputs.page_url }}" >>"$GITHUB_STEP_SUMMARY"
